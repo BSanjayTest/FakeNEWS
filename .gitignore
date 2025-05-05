@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.venv/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+
+# Data & Models (if large or sensitive)
+# data/*.csv
+# models/*.pkl
+
+# Secrets (if any)
+.env
+*.env*
+!*.env.example 
