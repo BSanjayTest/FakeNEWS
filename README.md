@@ -49,4 +49,4 @@ A simple web application to classify news text as potentially fake or true using
 
 ## Deployment
 
-This project is configured for deployment on Vercel via the `vercel.json` file. 
+This project is configured for deployment on Vercel via the `vercel.json` file. "# FakeNewsA1" 
