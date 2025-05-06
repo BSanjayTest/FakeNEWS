@@ -29,10 +29,15 @@ SIMILARITY_THRESHOLD = 0.5 # Minimum cosine similarity to be considered 'similar
 MAX_SIMILAR_RESULTS = 3 # Show top N similar fake/true
 MAX_EXCESSIVE_PUNCT = 5 # Threshold for flagging punctuation
 MAX_ALL_CAPS_WORDS = 5 # Threshold for flagging all caps words
-LLM_MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" # Model identifier for Hugging Face
-LLM_MAX_NEW_TOKENS = 100 # Max tokens for the LLM to GENERATE
+
+# LLM Configuration
+PRIMARY_LLM_MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0" # Original model
+SECONDARY_LLM_MODEL_NAME = "Qwen/Qwen2-1.5B-Instruct" # Open-access model, not gated
+ALTERNATIVE_LLM_MODEL_NAME = "microsoft/phi-2" # Small but powerful 2.7B model
+LLM_MAX_NEW_TOKENS = 250 # Increased from 100 to get complete sentences
 LLM_TEMPERATURE = 0.7
-# LLM_CONTEXT_SIZE removed, handled by model implicitly to some extent
+USE_SECONDARY_MODEL = True # Set to False to only use primary model
+USE_ALTERNATIVE_MODEL = True # If True and secondary fails, will try this before falling back to primary
 # --- End Configuration ---
 
 # Define paths relative to the app.py file location
@@ -50,8 +55,10 @@ classifier = None
 vectorizer = None
 processed_data_df = None
 all_text_vectors = None
-llm_model = None # Transformers model object
-llm_tokenizer = None # Transformers tokenizer object
+llm_primary_model = None # Primary model (TinyLlama)
+llm_primary_tokenizer = None # Primary tokenizer
+llm_secondary_model = None # Secondary model (Mistral)
+llm_secondary_tokenizer = None # Secondary tokenizer
 
 try:
     print(f"Attempting to load classifier model pipeline structure from: {model_path}")
@@ -95,7 +102,7 @@ except Exception as e:
 
 # --- Load LLM using Transformers (Experimental) ---
 if AutoModelForCausalLM is not None and AutoTokenizer is not None and torch is not None:
-    print(f"Attempting to load LLM model and tokenizer: {LLM_MODEL_NAME}")
+    print(f"Attempting to load LLM model and tokenizer: {PRIMARY_LLM_MODEL_NAME}")
     print("This may take time and download model data on the first run.")
     print("Attempting to use GPU (CUDA) if available.")
     try:
@@ -131,21 +138,88 @@ if AutoModelForCausalLM is not None and AutoTokenizer is not None and torch is n
             print("CUDA not available. Using CPU with float32 precision. (Expect slow performance)")
 
         # Load tokenizer (usually doesn't need specific device/dtype)
-        llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
+        llm_primary_tokenizer = AutoTokenizer.from_pretrained(PRIMARY_LLM_MODEL_NAME)
 
         # Load model using device_map="auto" with accelerate library
         # This lets accelerate handle placing layers on CPU/GPU optimally
         # Specify dtype for potential VRAM savings on GPU
-        llm_model = AutoModelForCausalLM.from_pretrained(
-            LLM_MODEL_NAME,
+        llm_primary_model = AutoModelForCausalLM.from_pretrained(
+            PRIMARY_LLM_MODEL_NAME,
             torch_dtype=dtype,
             device_map="auto" # Requires `accelerate` library
         )
         # No need for explicit .to(device) when using device_map="auto"
 
-        llm_model.eval()
+        llm_primary_model.eval()
         # Verify the final device placement (might be mixed CPU/GPU)
-        print(f"LLM model loaded. Final device map: {llm_model.hf_device_map}")
+        print(f"Primary LLM model loaded. Final device map: {llm_primary_model.hf_device_map}")
+
+        # Load secondary model if enabled
+        if USE_SECONDARY_MODEL:
+            print(f"Attempting to load secondary LLM model and tokenizer: {SECONDARY_LLM_MODEL_NAME}")
+            try:
+                llm_secondary_tokenizer = AutoTokenizer.from_pretrained(SECONDARY_LLM_MODEL_NAME)
+                
+                # Try to check if bitsandbytes is available
+                try:
+                    import bitsandbytes
+                    from transformers import BitsAndBytesConfig
+                    
+                    # 4-bit quantization configuration
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=torch.float16
+                    )
+                    
+                    print("Using 4-bit quantization for secondary model")
+                    llm_secondary_model = AutoModelForCausalLM.from_pretrained(
+                        SECONDARY_LLM_MODEL_NAME,
+                        quantization_config=bnb_config,
+                        device_map="auto"
+                    )
+                except ImportError:
+                    print("bitsandbytes not available, loading model with standard configuration")
+                    # Fall back to regular loading with device_map="auto"
+                    llm_secondary_model = AutoModelForCausalLM.from_pretrained(
+                        SECONDARY_LLM_MODEL_NAME,
+                        torch_dtype=dtype,
+                        device_map="auto",
+                        low_cpu_mem_usage=True
+                    )
+                
+                llm_secondary_model.eval()
+                print(f"Secondary LLM model loaded. Final device map: {llm_secondary_model.hf_device_map}")
+            except Exception as e:
+                print(f"CRITICAL ERROR loading secondary LLM model: {e}")
+                print(traceback.format_exc())
+                llm_secondary_model = None
+                llm_secondary_tokenizer = None
+                print("Secondary LLM functionality disabled, falling back to alternative or primary model.")
+                
+                # Try loading alternative model if enabled and secondary model failed
+                if USE_ALTERNATIVE_MODEL:
+                    print(f"Attempting to load alternative LLM model: {ALTERNATIVE_LLM_MODEL_NAME}")
+                    try:
+                        # Load alternative model and tokenizer
+                        llm_secondary_tokenizer = AutoTokenizer.from_pretrained(ALTERNATIVE_LLM_MODEL_NAME)
+                        llm_secondary_model = AutoModelForCausalLM.from_pretrained(
+                            ALTERNATIVE_LLM_MODEL_NAME,
+                            torch_dtype=dtype,
+                            device_map="auto",
+                            low_cpu_mem_usage=True
+                        )
+                        llm_secondary_model.eval()
+                        print(f"Alternative LLM model loaded successfully as secondary model.")
+                    except Exception as alt_e:
+                        print(f"ERROR loading alternative model: {alt_e}")
+                        print(traceback.format_exc())
+                        llm_secondary_model = None
+                        llm_secondary_tokenizer = None
+                        print("Alternative model loading failed, falling back to primary model only.")
+        else:
+            print("Secondary LLM model loading skipped (disabled in configuration).")
 
     except MemoryError as mem_err:
          # Check if it's CUDA OOM
@@ -155,13 +229,13 @@ if AutoModelForCausalLM is not None and AutoTokenizer is not None and torch is n
          else:
              print("CRITICAL ERROR: System Out of Memory while loading LLM.")
          print("LLM functionality disabled.")
-         llm_model = None
-         llm_tokenizer = None
+         llm_primary_model = None
+         llm_primary_tokenizer = None
     except Exception as e:
         print(f"CRITICAL ERROR loading LLM with transformers: {e}")
         print(traceback.format_exc())
-        llm_model = None
-        llm_tokenizer = None
+        llm_primary_model = None
+        llm_primary_tokenizer = None
 else:
     print("LLM loading skipped because transformers or torch could not be imported.")
 # --- End Loading ---
@@ -281,57 +355,106 @@ def scrape_duckduckgo(query):
 
 # --- LLM Analysis Function (Using Transformers) ---
 def get_llm_analysis(text, scraped_snippets):
-    if llm_model is None or llm_tokenizer is None or torch is None:
-        return "LLM analysis disabled (model/tokenizer not loaded)."
+    # Check if we have at least one model available
+    if (llm_primary_model is None or llm_primary_tokenizer is None) and (llm_secondary_model is None or llm_secondary_tokenizer is None):
+        return "LLM analysis disabled (no models loaded)."
+    
+    if torch is None:
+        return "LLM analysis disabled (torch not available)."
 
     print("Starting LLM analysis (Transformers)...")
     start_time = pd.Timestamp.now()
 
-    # Format prompt for TinyLlama Chat
+    # Format prompt for analysis
     messages = [
         {"role": "system", "content": "You are a helpful assistant analyzing news credibility."},
-        {"role": "user", "content": f"Analyze the following news text. Is it likely true or fake? Consider the provided search result snippets if available. Provide a brief justification.\n\nNews Text: '{text}'\n"}
+        {"role": "user", "content": f"Analyze the following news text. Is it likely true or fake? Consider the provided search result snippets if available. Provide a thorough justification with a complete analysis including key evidence to support your conclusion. Be specific. Never leave your analysis incomplete or cut off mid-sentence.\n\nNews Text: '{text}'\n"}
     ]
     if scraped_snippets:
-         messages[1]["content"] += "\nRelevant Search Snippets:\n" + "\n".join([f"{i+1}. {s}" for i, s in enumerate(scraped_snippets[:2])])
+         messages[1]["content"] += "\nRelevant Search Snippets:\n" + "\n".join([f"{i+1}. {s}" for i, s in enumerate(scraped_snippets[:3])])
 
-    # Prepare prompt using tokenizer's chat template
-    prompt_text = llm_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    try:
-        device = llm_model.device # Get device model is on
-        inputs = llm_tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=1024).to(device) # Truncate long inputs
-
-        # Generate text
-        with torch.no_grad(): # Disable gradient calculation for inference
-            outputs = llm_model.generate(
-                **inputs,
-                max_new_tokens=LLM_MAX_NEW_TOKENS,
-                temperature=LLM_TEMPERATURE,
-                do_sample=True, # Use sampling for temperature > 0
-                pad_token_id=llm_tokenizer.eos_token_id # Avoid padding warning
-            )
-        # Decode only the newly generated tokens
-        output_text = llm_tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-
-        analysis = output_text.strip()
-        end_time = pd.Timestamp.now()
-        duration = (end_time - start_time).total_seconds()
-        print(f"LLM analysis complete in {duration:.2f} seconds.")
-        return analysis if analysis else "LLM returned empty analysis."
-
-    except RuntimeError as OOM_error:
-        if "out of memory" in str(OOM_error).lower():
-             print("ERROR: CUDA Out of Memory during LLM inference (if using GPU).")
-             return "Error: Out of memory during LLM analysis."
-        else:
-             print(f"Runtime Error during LLM inference: {OOM_error}")
-             print(traceback.format_exc())
-             return "Runtime Error during LLM analysis."
-    except Exception as e:
-        print(f"Error during LLM inference: {e}")
-        print(traceback.format_exc())
-        return "Error during LLM analysis."
+    # Try secondary model first if available (it's more powerful)
+    if USE_SECONDARY_MODEL and llm_secondary_model is not None and llm_secondary_tokenizer is not None:
+        try:
+            print("Using secondary (more powerful) model for analysis...")
+            
+            # Prepare prompt using tokenizer's chat template
+            prompt_text = llm_secondary_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            
+            device = llm_secondary_model.device
+            inputs = llm_secondary_tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=1024).to(device)
+            
+            # Generate text
+            with torch.no_grad():
+                outputs = llm_secondary_model.generate(
+                    **inputs,
+                    max_new_tokens=LLM_MAX_NEW_TOKENS,
+                    temperature=LLM_TEMPERATURE,
+                    do_sample=True,
+                    pad_token_id=llm_secondary_tokenizer.eos_token_id
+                )
+            
+            # Decode only the newly generated tokens
+            output_text = llm_secondary_tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            
+            analysis = output_text.strip()
+            end_time = pd.Timestamp.now()
+            duration = (end_time - start_time).total_seconds()
+            print(f"Secondary LLM analysis complete in {duration:.2f} seconds.")
+            
+            if analysis:
+                return analysis
+            else:
+                print("Secondary model returned empty analysis, falling back to primary model.")
+        except Exception as e:
+            print(f"Error during secondary LLM inference: {e}")
+            print(traceback.format_exc())
+            print("Falling back to primary model.")
+    
+    # Fall back to primary model if secondary failed or isn't available
+    if llm_primary_model is not None and llm_primary_tokenizer is not None:
+        try:
+            print("Using primary model for analysis...")
+            
+            # Prepare prompt using tokenizer's chat template
+            prompt_text = llm_primary_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            
+            device = llm_primary_model.device
+            inputs = llm_primary_tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=1024).to(device)
+            
+            # Generate text with longer max_new_tokens to avoid cut-off sentences
+            with torch.no_grad():
+                outputs = llm_primary_model.generate(
+                    **inputs,
+                    max_new_tokens=LLM_MAX_NEW_TOKENS,
+                    temperature=LLM_TEMPERATURE,
+                    do_sample=True,
+                    pad_token_id=llm_primary_tokenizer.eos_token_id
+                )
+            
+            # Decode only the newly generated tokens
+            output_text = llm_primary_tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            
+            analysis = output_text.strip()
+            end_time = pd.Timestamp.now()
+            duration = (end_time - start_time).total_seconds()
+            print(f"Primary LLM analysis complete in {duration:.2f} seconds.")
+            
+            return analysis if analysis else "LLM returned empty analysis."
+        except RuntimeError as OOM_error:
+            if "out of memory" in str(OOM_error).lower():
+                print("ERROR: CUDA Out of Memory during LLM inference (if using GPU).")
+                return "Error: Out of memory during LLM analysis."
+            else:
+                print(f"Runtime Error during LLM inference: {OOM_error}")
+                print(traceback.format_exc())
+                return "Runtime Error during LLM analysis."
+        except Exception as e:
+            print(f"Error during primary LLM inference: {e}")
+            print(traceback.format_exc())
+            return "Error during LLM analysis."
+    
+    return "No LLM models were available for analysis."
 
 # --- Flask Routes ---
 @app.route('/')
@@ -460,13 +583,34 @@ if __name__ == '__main__':
     else:
         print("\nAll required models and data loaded successfully.")
 
-    # Check for LLM via Transformers
-    if AutoModelForCausalLM is not None and (llm_model is None or llm_tokenizer is None):
-        print("\nWARNING: LLM (Transformers) was not loaded successfully (check errors above). LLM analysis will be disabled.")
+    # Check for LLMs via Transformers
+    if AutoModelForCausalLM is not None:
+        primary_status = "Not loaded" if llm_primary_model is None else f"Ready (Device: {llm_primary_model.device})"
+        secondary_status = "Disabled"
+        alternative_status = "Disabled" 
+        
+        if USE_SECONDARY_MODEL:
+            if llm_secondary_model is not None:
+                # Check if it's the original secondary or the alternative
+                if ALTERNATIVE_LLM_MODEL_NAME in str(llm_secondary_model.config):
+                    secondary_status = "Failed"
+                    alternative_status = f"Ready (Device: {llm_secondary_model.device}) - Used as secondary"
+                else:
+                    secondary_status = f"Ready (Device: {llm_secondary_model.device})"
+                    alternative_status = "Not needed" if not USE_ALTERNATIVE_MODEL else "Standby"
+            else:
+                secondary_status = "Failed to load"
+                alternative_status = "Failed or not loaded" if USE_ALTERNATIVE_MODEL else "Not enabled"
+        
+        print(f"\nLLM Status:")
+        print(f"  - Primary (TinyLlama): {primary_status}")
+        print(f"  - Secondary (Qwen2): {secondary_status}")
+        print(f"  - Alternative (Phi-2): {alternative_status}")
+        
+        if llm_primary_model is None and llm_secondary_model is None:
+            print("\nWARNING: No LLM models were loaded successfully. LLM analysis will be disabled.")
     elif AutoModelForCausalLM is None:
         print("\nINFO: transformers/torch not installed/imported. LLM analysis is disabled.")
-    else:
-        print(f"\nLLM (Transformers) loaded and ready for analysis (Device: {llm_model.device if llm_model else 'None'}).")
 
     print(f"\nStarting Flask server on port {port} with debug mode: {debug_mode}")
     app.run(host='0.0.0.0', port=port, debug=debug_mode) 
